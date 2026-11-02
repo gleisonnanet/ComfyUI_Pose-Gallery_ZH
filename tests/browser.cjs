@@ -1,0 +1,143 @@
+// Requires a dedicated instance: POSE_GALLERY_TEST_URL=http://127.0.0.1:8197 npm run test:browser
+// Clears its current graph and executes image previews. No generation models are loaded.
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const { chromium } = require('playwright');
+const base = process.env.POSE_GALLERY_TEST_URL;
+if (!base) throw new Error('Set POSE_GALLERY_TEST_URL to a dedicated test instance.');
+const root = path.resolve(__dirname, '..');
+const output = path.join(root, '.test-output');
+fs.mkdirSync(output, {recursive:true});
+const items = JSON.parse(fs.readFileSync(path.join(root, 'data/pose-pt.json'), 'utf8'));
+
+(async () => {
+    const browser = await chromium.launch({headless:true, ...(process.env.POSE_GALLERY_BROWSER_CHANNEL ? {channel:process.env.POSE_GALLERY_BROWSER_CHANNEL} : {})});
+    try {
+        const page = await browser.newPage({viewport:{width:1450,height:1000},locale:'pt-BR',reducedMotion:'reduce'});
+        const errors = [];
+        page.on('pageerror', error => errors.push(error.message));
+        await page.goto(base);
+        await page.waitForFunction(() => window.app?.graph && window.LiteGraph?.registered_node_types.PoseGalleryBatch);
+        await page.waitForTimeout(700);
+        await page.keyboard.press('Escape');
+        await page.evaluate(() => app.graph.clear());
+        await page.getByRole('button',{name:'Galeria de poses · referências em português',exact:true}).click();
+        const side = page.locator('.pg-app').first();
+        await side.locator('.pg-card').first().waitFor();
+        assert.equal(await side.locator('.pg-card').count(),48);
+        const bottom = await side.locator('.pg-bottom').boundingBox();
+        assert.ok(bottom.y+bottom.height<=1001,'sidebar actions stay inside viewport');
+        const boxes=await side.locator('.pg-card').evaluateAll(cards=>cards.slice(0,2).map(card=>card.getBoundingClientRect().toJSON()));
+        assert.equal(boxes[0].y,boxes[1].y,'sidebar uses two columns');
+        await side.locator('.pg-filters select').nth(0).selectOption('Corpo inteiro 1 pessoa · padrão');
+        await side.getByRole('searchbox').fill('P001 sentada');
+        assert.equal(await side.locator('.pg-card').count(),1);
+        await side.locator('.pg-favorite').click();
+        await side.getByRole('button',{name:'♡ Favoritas',exact:true}).click();
+        assert.equal(await side.locator('.pg-card').count(),1);
+        await side.getByRole('button',{name:'Todas as poses',exact:true}).click();
+        await side.locator('.pg-check input').check();
+        await page.getByRole('button',{name:'Galeria de poses · referências em português',exact:true}).click();
+        await page.getByRole('button',{name:'Galeria de poses · referências em português',exact:true}).click();
+        await side.locator('.pg-card').first().waitFor();
+        assert.equal(await side.getByRole('searchbox').inputValue(),'P001 sentada');
+        assert.match(await side.locator('.pg-selection-label').textContent(),/1 \/ 32/);
+        await side.getByRole('button',{name:'Limpar',exact:true}).click();
+        await side.locator('.pg-image-button').click();
+        await page.locator('.pg-viewer .pg-viewer-angles').getByRole('button',{name:'Perfil',exact:true}).click();
+        await page.locator('.pg-viewer').getByRole('button',{name:'Usar esta pose',exact:true}).click();
+        let saved=await page.evaluate(()=>app.graph.serialize());
+        assert.equal(saved.nodes.length,1);
+        assert.deepEqual(saved.nodes[0].widgets_values.slice(0,6),['full_single_P001_side','Biblioteca interna','Tamanho original',768,1024,false]);
+        await page.evaluate(() => {
+            const node=app.graph._nodes[0];
+            for(const [name,value] of Object.entries({resize_mode:'Ajustar com borda',width:128,height:160,flip_horizontal:true})) node.widgets.find(w=>w.name===name).value=value;
+            const preview=LiteGraph.createNode('PreviewImage'); preview.pos=[520,80]; app.graph.add(preview); node.connect(0,preview,0);
+            node.widgets.find(w=>w.name==='Abrir galeria de poses').callback();
+        });
+        const expanded=page.locator('.pg-expanded .pg-app');
+        await expanded.locator('.pg-card').first().waitFor();
+        assert.notEqual(await expanded.locator('.pg-target-row select').inputValue(),'');
+        await expanded.locator('.pg-filters select').nth(0).selectOption('Corpo inteiro 1 pessoa · padrão');
+        await expanded.getByRole('searchbox').fill('P001');
+        await expanded.locator('.pg-image-button').click();
+        await page.locator('.pg-viewer').getByRole('button',{name:'Usar esta pose',exact:true}).click();
+        saved=await page.evaluate(()=>app.graph.serialize());
+        assert.equal(saved.nodes.length,2);
+        assert.equal(saved.links.length,1);
+        assert.deepEqual(saved.nodes[0].widgets_values.slice(0,6),['full_single_P001_front','Biblioteca interna','Ajustar com borda',128,160,true]);
+        await expanded.locator('.pg-image-button').click();
+        await page.locator('.pg-viewer').getByRole('button',{name:'Escolher todos os ângulos desta pose',exact:true}).click();
+        await page.locator('.pg-viewer').getByRole('button',{name:'Fechar ×',exact:true}).click();
+        await expanded.getByRole('button',{name:'Enviar seleção',exact:true}).click();
+        await expanded.locator('.pg-message').filter({hasText:'recebe só uma imagem'}).waitFor();
+        assert.equal(await page.evaluate(()=>app.graph._nodes.length),2);
+        await expanded.locator('.pg-target-row select').selectOption('');
+        await expanded.getByRole('button',{name:'Enviar seleção',exact:true}).click();
+        assert.equal(await page.evaluate(()=>app.graph._nodes.length),3);
+        await page.evaluate(() => {
+            const batch=app.graph._nodes.find(n=>n.type==='PoseGalleryBatch');
+            for (const [name,value] of Object.entries({width:64,height:80})) batch.widgets.find(w=>w.name===name).value=value;
+            const preview=LiteGraph.createNode('PreviewImage'); preview.pos=[1000,80]; app.graph.add(preview); batch.connect(0,preview,0);
+        });
+        const groups=new Map();
+        for(const item of items) { const key=JSON.stringify([item.serie,item.numero]); if(!groups.has(key)) groups.set(key,[]); groups.get(key).push(item); }
+        const missing=[...groups.values()].find(group=>group.length===4)[0];
+        await expanded.getByRole('button',{name:'Limpar filtros',exact:true}).click();
+        await expanded.getByRole('searchbox').fill(missing.id);
+        assert.equal(await expanded.locator('.pg-angle-strip button:disabled').count(),1);
+        await expanded.locator('.pg-image-button').click();
+        assert.equal(await page.locator('.pg-viewer .pg-viewer-angles button:disabled').count(),1);
+        await page.locator('.pg-viewer').getByRole('button',{name:'Fechar ×',exact:true}).click();
+        await expanded.getByRole('button',{name:'Limpar filtros',exact:true}).click();
+        await expanded.locator('.pg-filters select').nth(0).selectOption('Corpo inteiro 1 pessoa · padrão');
+        await expanded.locator('.pg-target-row select').selectOption('');
+        await expanded.getByRole('button',{name:'Limpar',exact:true}).click();
+        await page.waitForTimeout(400);
+        await page.locator('.pg-expanded').screenshot({path:path.join(root,'docs/plugin-preview.png')});
+        await page.getByRole('button',{name:'Voltar ao fluxo ×',exact:true}).click();
+        saved=await page.evaluate(()=>app.graph.serialize());
+        fs.writeFileSync(path.join(output,'roundtrip.json'),JSON.stringify(saved,null,2));
+        await page.evaluate(async workflow=>{ await app.loadGraphData(workflow); },saved);
+        const prompt=await page.evaluate(async()=> (await app.graphToPrompt()).output);
+        const pluginPrompts=Object.values(prompt).filter(n=>n.class_type.startsWith('PoseGallery'));
+        assert.equal(pluginPrompts.length,2);
+        assert.ok(pluginPrompts.every(n=>!('pose_gallery_preview' in n.inputs)&&!('Abrir galeria de poses' in n.inputs)));
+        const queued=await page.request.post(base+'/prompt',{data:{prompt}});
+        assert.equal(queued.status(),200,await queued.text());
+        const {prompt_id}=await queued.json();
+        let history;
+        for(let i=0;i<120;i++) {
+            const response=await page.request.get(base+'/history/'+prompt_id);
+            history=(await response.json())[prompt_id];
+            if(history) break;
+            await page.waitForTimeout(250);
+        }
+        assert.equal(history?.status.status_str,'success',JSON.stringify(history?.status));
+        const files=Object.values(history.outputs).flatMap(output=>output.images||[]);
+        assert.equal(files.length,6);
+        const dimensions=[];
+        for(const file of files) {
+            const response=await page.request.get(base+'/view?'+new URLSearchParams(file));
+            const bytes=await response.body();
+            assert.equal(bytes.subarray(1,4).toString(),'PNG');
+            dimensions.push([bytes.readUInt32BE(16),bytes.readUInt32BE(20)]);
+        }
+        assert.equal(dimensions.filter(([w,h])=>w===128&&h===160).length,1);
+        assert.equal(dimensions.filter(([w,h])=>w===64&&h===80).length,5);
+        await side.getByRole('button',{name:'Configurar acervo',exact:true}).click();
+        const settings=page.locator('.pg-settings');
+        await settings.locator('input').fill(root);
+        await settings.getByRole('button',{name:'Verificar e salvar',exact:true}).click();
+        await settings.locator('.pg-settings-status').filter({hasText:'Salvo'}).waitFor();
+        await settings.getByRole('button',{name:'Fechar ×',exact:true}).click();
+        await side.locator('.pg-controls > .pg-field select').selectOption('custom');
+        await side.locator('.pg-card').first().waitFor();
+        assert.match(await side.locator('.pg-brand p').textContent(),/1439/);
+        const reset=await page.request.post(base+'/pose_gallery/settings',{data:{custom_directory:''}});
+        assert.equal(reset.status(),200);
+        assert.deepEqual(errors,[]);
+        console.log('Browser checks passed: sidebar, filters, favorites, angles, targeted updates, batch, save/reload, 6 output images, custom directory.');
+    } finally { await browser.close(); }
+})().catch(error=>{console.error(error);process.exitCode=1;});
